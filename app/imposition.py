@@ -17,6 +17,7 @@
 """
 from __future__ import annotations
 
+import math
 from typing import Collection, List, Literal, Optional, Tuple, TypeVar
 
 Binding = Literal["left", "right"]
@@ -197,6 +198,160 @@ def press_layout(
         "paper_height_mm": paper_height,
         "signature_count": len(result_signatures),
         "signatures": result_signatures,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 瑕疵定位（locate-defects）：纸面坐标 -> 原稿页码与阅读方向页内坐标
+# ---------------------------------------------------------------------------
+
+class DefectPointError(ValueError):
+    """单个瑕疵点参数非法（帖号/张号无效或坐标越界/非有限）。
+
+    携带该点在请求 ``defects`` 列表中的序号（从 0 开始）与出错字段，
+    供 API 层构造定位到具体点的 422 明细。
+    """
+
+    def __init__(self, defect_index: int, field: str, message: str) -> None:
+        super().__init__(message)
+        self.defect_index = defect_index
+        self.field = field
+
+
+def _finite(value: float) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _locate_one_defect(layout: dict, defect: dict, defect_index: int) -> dict:
+    """定位单个瑕疵点，返回该点的定位结果（含 ``status``）。
+
+    纸面坐标以纸张**左上角**为原点（x 向右、y 向下，单位 mm）。分类顺序：
+
+    1. 坐标非有限或越出纸面 -> 抛 :class:`DefectPointError`（API 返回 422）；
+    2. 落在中缝（左槽与右槽之间，边界归入中缝）-> ``status="gutter"``，无页码；
+    3. 落在某槽位但该槽位为空白页位 -> ``status="blank"``，无页码；
+    4. 其余 -> ``status="located"``，给出页码与**阅读方向**的页内坐标：
+       页位旋转 0° 时直接取相对槽位左上角的坐标；旋转 180°（短边翻转背面）
+       时逆转 180°，即 ``(页宽-槽内x, 页高-槽内y)``。
+    """
+    side = defect["side"]
+    x = defect["x_mm"]
+    y = defect["y_mm"]
+
+    for field, value in (("x_mm", x), ("y_mm", y)):
+        if not _finite(value):
+            raise DefectPointError(
+                defect_index, field, f"瑕疵点坐标 {field} 必须为有限数值（单位 mm）"
+            )
+
+    paper_width = layout["paper_width_mm"]
+    paper_height = layout["paper_height_mm"]
+    page_width = layout["page_width_mm"]
+    gutter = layout["gutter_mm"]
+    if x < 0 or x > paper_width or y < 0 or y > paper_height:
+        raise DefectPointError(
+            defect_index,
+            "x_mm" if not (0 <= x <= paper_width) else "y_mm",
+            f"瑕疵点 ({x}, {y}) 越出纸面（纸面 {paper_width} × {paper_height} mm）",
+        )
+
+    if not (1 <= defect["signature_index"] <= len(layout["signatures"])):
+        raise DefectPointError(
+            defect_index,
+            "signature_index",
+            f"帖号无效：共 {len(layout['signatures'])} 帖，"
+            f"收到帖号 {defect['signature_index']}",
+        )
+    signature = layout["signatures"][defect["signature_index"] - 1]
+    if not (1 <= defect["sheet_index"] <= len(signature["sheets"])):
+        raise DefectPointError(
+            defect_index,
+            "sheet_index",
+            f"张号无效：第 {defect['signature_index']} 帖共 "
+            f"{len(signature['sheets'])} 张，收到张号 {defect['sheet_index']}",
+        )
+    sheet = signature["sheets"][defect["sheet_index"] - 1]
+
+    right_slot_x = page_width + gutter
+    if page_width <= x <= right_slot_x:
+        # 中缝（gutter=0 时为左右槽分界折线）；边界归入中缝
+        slot_name: Optional[str] = None
+        status = "gutter"
+    elif x < page_width:
+        slot_name = "left"
+        status = "located"
+    else:
+        slot_name = "right"
+        status = "located"
+
+    result = {
+        "signature_index": defect["signature_index"],
+        "sheet_index": defect["sheet_index"],
+        "side": side,
+        "x_mm": x,
+        "y_mm": y,
+        "status": status,
+        "slot": slot_name,
+        "page": None,
+        "page_x_mm": None,
+        "page_y_mm": None,
+    }
+
+    if slot_name is None:
+        return result
+
+    placement = sheet[side][slot_name]
+    if placement is None:
+        # 落在空白页位（末帖补白等）：明确标记且不返回页码
+        result["status"] = "blank"
+        return result
+
+    slot_x = x - placement["x_mm"]
+    slot_y = y - placement["y_mm"]
+    if placement["rotation_deg"] == 180:
+        # 逆转 180°：把已旋转落版的点还原到阅读方向
+        page_x = page_width - slot_x
+        page_y = paper_height - slot_y
+    else:
+        page_x = slot_x
+        page_y = slot_y
+
+    result["status"] = "located"
+    result["page"] = placement["page"]
+    result["page_x_mm"] = page_x
+    result["page_y_mm"] = page_y
+    return result
+
+
+def locate_defects(layout: dict, defects: List[dict]) -> dict:
+    """在 :func:`press_layout` 结果上批量定位瑕疵点。
+
+    ``defects`` 每项含帖号 ``signature_index``、张号 ``sheet_index``（均从 1 开始）、
+    正反面 ``side``（``front`` / ``back``）与纸面左上角起算的 ``x_mm`` / ``y_mm``。
+    逐点返回对应原稿页码及**阅读方向**的页内坐标；落在中缝或空白页位的点分别标记为
+    ``gutter`` / ``blank`` 且不返回页码。帖号/张号无效或坐标越出纸面时抛
+    :class:`DefectPointError`。
+    """
+    located = [
+        _locate_one_defect(layout, defect, index)
+        for index, defect in enumerate(defects)
+    ]
+    return {
+        "total_pages": layout["total_pages"],
+        "max_sheets_per_signature": layout["max_sheets_per_signature"],
+        "binding": layout["binding"],
+        "page_width_mm": layout["page_width_mm"],
+        "page_height_mm": layout["page_height_mm"],
+        "gutter_mm": layout["gutter_mm"],
+        "duplex_flip": layout["duplex_flip"],
+        "paper_width_mm": layout["paper_width_mm"],
+        "paper_height_mm": layout["paper_height_mm"],
+        "signature_count": layout["signature_count"],
+        "defect_count": len(located),
+        "located_count": sum(1 for item in located if item["status"] == "located"),
+        "gutter_count": sum(1 for item in located if item["status"] == "gutter"),
+        "blank_count": sum(1 for item in located if item["status"] == "blank"),
+        "defects": located,
     }
 
 

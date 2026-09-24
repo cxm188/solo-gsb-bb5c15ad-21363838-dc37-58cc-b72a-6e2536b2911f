@@ -13,8 +13,10 @@ from .imposition import (
     impose,
     impose_chapters,
     inspect_observed_sheets,
+    locate_defects,
     plan_reprint,
     press_layout,
+    DefectPointError,
     UNREAD,
 )
 from .proof import (
@@ -36,8 +38,9 @@ app = FastAPI(
         "与预期拼版配对并核对已知页位。"
         "支持机台版面：在拼版结果上给出纸面尺寸与正反面各页位的坐标、旋转角。"
         "支持双面拼版校样：按机台版面输出可下载的 proof.pdf。"
+        "支持瑕疵定位：把纸面坐标反查为原稿页码与阅读方向页内坐标。"
     ),
-    version="1.5.0",
+    version="1.6.0",
 )
 
 
@@ -163,6 +166,84 @@ class PressLayoutResponse(BaseModel):
     paper_height_mm: float = Field(..., description="纸面高度（mm）= 页高")
     signature_count: int
     signatures: list[PressLayoutSignature]
+
+
+# ---------------------------------------------------------------------------
+# 瑕疵定位 /api/v1/impose/locate-defects
+# ---------------------------------------------------------------------------
+
+
+class DefectPoint(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    signature_index: int = Field(..., ge=1, description="帖号，从 1 开始")
+    sheet_index: int = Field(..., ge=1, description="帖内纸张序号，从 1 开始（1 为最外张）")
+    side: Literal["front", "back"] = Field(
+        ..., description="正反面：front=正面，back=背面"
+    )
+    x_mm: float = Field(..., description="瑕疵点 x 坐标（mm），以纸面左上角为原点")
+    y_mm: float = Field(..., description="瑕疵点 y 坐标（mm），以纸面左上角为原点")
+
+    @field_validator("x_mm", "y_mm")
+    @classmethod
+    def validate_finite_mm(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("瑕疵点坐标必须为有限数值（单位 mm）")
+        return value
+
+
+class LocateDefectsRequest(PressLayoutRequest):
+    """瑕疵定位请求：版面参数与机台版面完全一致，另收瑕疵点列表。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    defects: list[DefectPoint] = Field(
+        ..., min_length=1, description="待定位的瑕疵点列表，至少 1 个"
+    )
+
+
+class LocatedDefect(BaseModel):
+    signature_index: int = Field(..., description="帖号，从 1 开始")
+    sheet_index: int = Field(..., description="帖内张号，从 1 开始（1 为最外张）")
+    side: Literal["front", "back"] = Field(..., description="正反面：front=正面，back=背面")
+    x_mm: float = Field(..., description="输入的纸面 x 坐标（mm）")
+    y_mm: float = Field(..., description="输入的纸面 y 坐标（mm）")
+    status: Literal["located", "gutter", "blank"] = Field(
+        ...,
+        description="定位结果：located=落在页位上，gutter=中缝，blank=空白页位",
+    )
+    slot: Optional[Literal["left", "right"]] = Field(
+        ..., description="命中的左/右槽；中缝为 null"
+    )
+    page: Optional[int] = Field(
+        ..., description="原稿页码（从 1 开始）；中缝或空白页位为 null"
+    )
+    page_x_mm: Optional[float] = Field(
+        ...,
+        description="阅读方向的页内 x 坐标（mm，自该页左上角向右）；中缝/空白为 null",
+    )
+    page_y_mm: Optional[float] = Field(
+        ...,
+        description="阅读方向的页内 y 坐标（mm，自该页左上角向下）；中缝/空白为 null",
+    )
+
+
+class LocateDefectsResponse(BaseModel):
+    total_pages: int
+    max_sheets_per_signature: int
+    binding: Literal["left", "right"]
+    page_width_mm: float
+    page_height_mm: float
+    gutter_mm: float
+    duplex_flip: Literal["long", "short"]
+    paper_width_mm: float = Field(..., description="纸面宽度（mm）= 2 × 页宽 + 中缝")
+    paper_height_mm: float = Field(..., description="纸面高度（mm）= 页高")
+    signature_count: int
+    defect_count: int = Field(..., description="请求中的瑕疵点总数")
+    located_count: int = Field(..., description="落在页位上、成功定位页码的点数")
+    gutter_count: int = Field(..., description="落在中缝的点数")
+    blank_count: int = Field(..., description="落在空白页位的点数")
+    defects: list[LocatedDefect] = Field(..., description="逐点定位结果，顺序与请求一致")
 
 
 # ---------------------------------------------------------------------------
@@ -465,6 +546,55 @@ def create_press_layout(request: PressLayoutRequest) -> PressLayoutResponse:
         duplex_flip=request.duplex_flip,
     )
     return PressLayoutResponse(**layout)
+
+
+@app.post(
+    "/api/v1/impose/locate-defects",
+    response_model=LocateDefectsResponse,
+    tags=["拼版"],
+    summary="瑕疵定位：纸面坐标反查原稿页码与阅读方向页内坐标",
+    responses={422: {"description": "帖号/张号无效、坐标越出纸面或参数非法"}},
+)
+def locate_press_defects(request: LocateDefectsRequest) -> LocateDefectsResponse:
+    layout = press_layout(
+        total_pages=request.total_pages,
+        max_sheets=request.max_sheets_per_signature,
+        binding=request.binding,
+        page_width_mm=request.page_width_mm,
+        page_height_mm=request.page_height_mm,
+        gutter_mm=request.gutter_mm,
+        duplex_flip=request.duplex_flip,
+    )
+    defects = [
+        {
+            "signature_index": point.signature_index,
+            "sheet_index": point.sheet_index,
+            "side": point.side,
+            "x_mm": point.x_mm,
+            "y_mm": point.y_mm,
+        }
+        for point in request.defects
+    ]
+    try:
+        result = locate_defects(layout, defects)
+    except DefectPointError as exc:
+        # 定位到具体点、具体字段的 422：loc 为 body -> defects -> 点序号 -> 字段
+        raise RequestValidationError(
+            [
+                {
+                    "type": "value_error",
+                    "loc": (
+                        "body",
+                        "defects",
+                        exc.defect_index,
+                        exc.field,
+                    ),
+                    "msg": str(exc),
+                    "input": defects[exc.defect_index],
+                }
+            ]
+        )
+    return LocateDefectsResponse(**result)
 
 
 @app.post(
