@@ -200,6 +200,131 @@ def press_layout(
     }
 
 
+# ---------------------------------------------------------------------------
+# 瑕疵定位（locate-defects）：纸面坐标反查原稿页码与阅读方向页内坐标
+# ---------------------------------------------------------------------------
+
+Side = Literal["front", "back"]
+
+# 单个瑕疵点：(帖号, 张号, 面, x_mm, y_mm)
+# 帖号/张号从 1 开始；面为 "front" 正面 / "back" 背面；
+# x/y 以纸面左上角为原点（x 向右、y 向下，单位 mm）
+DefectPoint = Tuple[int, int, Side, float, float]
+
+
+def locate_defects(
+    total_pages: int,
+    max_sheets: int,
+    binding: Binding,
+    page_width_mm: float,
+    page_height_mm: float,
+    gutter_mm: float,
+    duplex_flip: DuplexFlip,
+    defects: List[DefectPoint],
+) -> dict:
+    """把纸面上的瑕疵点反查为原稿页码与阅读方向的页内坐标。
+
+    页序、槽位与旋转规则完全沿用 :func:`press_layout`：正面与 ``long`` 背面
+    旋转 0°（``long`` 背面按交换后的槽位定位），``short`` 背面各页位绕自身
+    中心旋转 180°，槽内坐标需逆转 180° 还原为阅读方向。
+
+    逐点返回（按请求顺序，序号 ``defect_index`` 从 1 开始）：
+
+    - 落在页内：``location="page"``，给出页码与页内坐标（从该页阅读方向的
+      左上角起算，x 向右、y 向下）；
+    - 落在中缝：``location="gutter"``；落在空白页位：``location="blank"``；
+      两者均不返回页码与页内坐标（相应字段为 ``None``）。
+
+    帖号/张号越界、面取值非法、坐标越出纸面（含负坐标与非有限值）时抛
+    ``ValueError``。
+    """
+    layout = press_layout(
+        total_pages,
+        max_sheets,
+        binding,
+        page_width_mm,
+        page_height_mm,
+        gutter_mm,
+        duplex_flip,
+    )
+    paper_width = layout["paper_width_mm"]
+    paper_height = layout["paper_height_mm"]
+    signatures = layout["signatures"]
+    gutter_end = page_width_mm + gutter_mm
+
+    results: List[dict] = []
+    for index, (signature_index, sheet_index, side, x_mm, y_mm) in enumerate(
+        defects, start=1
+    ):
+        if not 1 <= signature_index <= len(signatures):
+            raise ValueError(
+                f"第 {index} 个瑕疵点的帖号 {signature_index} 无效："
+                f"共 {len(signatures)} 帖"
+            )
+        signature = signatures[signature_index - 1]
+        sheets = signature["sheets"]
+        if not 1 <= sheet_index <= len(sheets):
+            raise ValueError(
+                f"第 {index} 个瑕疵点的张号 {sheet_index} 无效："
+                f"第 {signature_index} 帖共 {len(sheets)} 张"
+            )
+        if side not in ("front", "back"):
+            raise ValueError(
+                f"第 {index} 个瑕疵点的面 {side!r} 非法："
+                "只支持 'front' / 'back'"
+            )
+        # 纸面边界含边缘；NaN/Infinity 比较恒为 False，同样落入越界分支
+        if not (0.0 <= x_mm <= paper_width) or not (0.0 <= y_mm <= paper_height):
+            raise ValueError(
+                f"第 {index} 个瑕疵点越出纸面：({x_mm}, {y_mm}) 不在"
+                f" 0..{paper_width} × 0..{paper_height}（mm）内"
+            )
+
+        sheet = sheets[sheet_index - 1]
+        pair = sheet[side]
+        if page_width_mm <= x_mm < gutter_end:
+            # 中缝（gutter_mm = 0 时该区间为空，不会命中）
+            item = {"location": "gutter", "page": None,
+                    "page_x_mm": None, "page_y_mm": None}
+        else:
+            slot = "left" if x_mm < page_width_mm else "right"
+            placement = pair[slot]
+            if placement is None:
+                # 空白页位（末帖补白）
+                item = {"location": "blank", "page": None,
+                        "page_x_mm": None, "page_y_mm": None}
+            else:
+                # 槽内坐标 -> 阅读方向页内坐标；180° 旋转绕页位中心逆转
+                dx = x_mm - placement["x_mm"]
+                dy = y_mm - placement["y_mm"]
+                if placement["rotation_deg"] == 180:
+                    page_x = page_width_mm - dx
+                    page_y = page_height_mm - dy
+                else:
+                    page_x, page_y = dx, dy
+                item = {
+                    "location": "page",
+                    "page": placement["page"],
+                    "page_x_mm": page_x,
+                    "page_y_mm": page_y,
+                }
+        results.append({"defect_index": index, **item})
+
+    return {
+        "total_pages": total_pages,
+        "max_sheets_per_signature": max_sheets,
+        "binding": binding,
+        "page_width_mm": page_width_mm,
+        "page_height_mm": page_height_mm,
+        "gutter_mm": gutter_mm,
+        "duplex_flip": duplex_flip,
+        "paper_width_mm": paper_width,
+        "paper_height_mm": paper_height,
+        "defect_count": len(results),
+        "defects": results,
+    }
+
+
 def split_signatures_by_chapters(
     total_pages: int,
     max_sheets: int,

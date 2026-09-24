@@ -17,6 +17,10 @@
 还提供**机台版面**接口 `/api/v1/impose/press-layout`：在上述拼版页序之上给出每张纸的纸面尺寸，
 以及正反面每个页位的页码、左上角坐标与旋转角度（支持双面打印的长边 / 短边翻转），空白页位保留 `null`。
 
+还提供**瑕疵定位**接口 `/api/v1/impose/locate-defects`：沿用机台版面的全部参数，另收瑕疵点列表
+（帖号、张号、正反面、纸面左上角起算的 x/y 毫米坐标），逐点反查对应的原稿页码与阅读方向的页内坐标；
+落在中缝或空白页位的点明确标记为 `gutter` / `blank` 且不返回页码。
+
 还提供**双面拼版校样**接口 `/api/v1/impose/proof.pdf`：参数与机台版面完全一致，直接返回可下载的
 `proof.pdf`——每张印张依次生成正面、背面两页，纸面尺寸与机台版面一致，各页位标注页码、帖号与张号，
 空白位标注“空白”，并画出中缝分隔线；长边 / 短边翻转的背面分别按槽位交换、旋转 180° 呈现。
@@ -62,6 +66,7 @@ HOST_PORT=9000 docker compose up -d --build
 - 重印复用接口：`POST http://localhost:8000/api/v1/impose/reprint`
 - 印张抽检接口：`POST http://localhost:8000/api/v1/impose/inspect`
 - 机台版面接口：`POST http://localhost:8000/api/v1/impose/press-layout`
+- 瑕疵定位接口：`POST http://localhost:8000/api/v1/impose/locate-defects`
 - 双面拼版校样（PDF 下载）：`POST http://localhost:8000/api/v1/impose/proof.pdf`
 
 ## 接口说明
@@ -244,6 +249,100 @@ curl -X POST http://localhost:8000/api/v1/impose/press-layout \
 未定义字段等）外，`page_width_mm` / `page_height_mm` 非正数（含 `0`、负数、`NaN`、
 `Infinity`）、`gutter_mm` 为负数或非有限值、`duplex_flip` 不是 `long`/`short` 时，
 均返回 `422 Unprocessable Entity`。
+
+## 瑕疵定位（POST /api/v1/impose/locate-defects）
+
+在机台版面的**相同分帖、页序、槽位与旋转规则**之上，把纸面上检测到的瑕疵点反查为
+**原稿页码**与**阅读方向的页内坐标**，用于质检系统定位缺陷来源。本地访问地址
+`http://localhost:8000/api/v1/impose/locate-defects`（改了 `HOST_PORT` 则对应替换端口）。
+
+### 请求
+
+`POST /api/v1/impose/locate-defects`，`Content-Type: application/json`
+
+机台版面的全部参数原样沿用（`total_pages` / `max_sheets_per_signature` / `binding` /
+`page_width_mm` / `page_height_mm` / `gutter_mm` / `duplex_flip`，约束相同），另加：
+
+| 字段 | 类型 | 约束 | 说明 |
+| --- | --- | --- | --- |
+| `defects` | 对象数组 | 非空 | 瑕疵点列表，逐点定位 |
+| `defects[].signature_index` | 整数 | ≥ 1 且不超过帖数 | 帖号，从 1 开始 |
+| `defects[].sheet_index` | 整数 | ≥ 1 且不超过该帖张数 | 帖内张号，从 1 开始（1 为最外张） |
+| `defects[].side` | 字符串 | `front` / `back` | 正反面：`front`=正面，`back`=背面 |
+| `defects[].x_mm` | 数值 | 有限值，且在纸面宽度内 | 瑕疵点 x 坐标（mm），以**纸面左上角**为原点、向右为正 |
+| `defects[].y_mm` | 数值 | 有限值，且在纸面高度内 | 瑕疵点 y 坐标（mm），以**纸面左上角**为原点、向下为正 |
+
+```bash
+curl -X POST http://localhost:8000/api/v1/impose/locate-defects \
+  -H "Content-Type: application/json" \
+  -d '{
+    "total_pages": 4,
+    "max_sheets_per_signature": 1,
+    "binding": "left",
+    "page_width_mm": 210,
+    "page_height_mm": 297,
+    "gutter_mm": 10,
+    "duplex_flip": "long",
+    "defects": [
+      {"signature_index": 1, "sheet_index": 1, "side": "front", "x_mm": 100, "y_mm": 50},
+      {"signature_index": 1, "sheet_index": 1, "side": "back",  "x_mm": 250, "y_mm": 40},
+      {"signature_index": 1, "sheet_index": 1, "side": "front", "x_mm": 215, "y_mm": 100}
+    ]
+  }'
+```
+
+### 定位规则
+
+- **坐标系**：与机台版面一致——纸面左上角为原点，x 向右、y 向下，单位 mm；
+  纸面宽 `2 × page_width_mm + gutter_mm`、高 `page_height_mm`，纸面边缘上的点有效。
+- **槽位判定**：左槽 `x ∈ [0, page_width_mm)`，中缝 `x ∈ [page_width_mm,
+  page_width_mm + gutter_mm)`（`gutter_mm = 0` 时无中缝），右槽
+  `x ∈ [page_width_mm + gutter_mm, paper_width_mm]`。
+- **页内坐标**：落在页内时，先取槽内坐标（减去槽位左上角），再按该页位的旋转角
+  还原为**阅读方向**（从该页自身左上角起算）：
+  - 正面与 `long`（长边翻转）背面旋转 `0°`，页内坐标即槽内坐标；
+    `long` 背面按**交换后的槽位**定位（与机台版面一致）；
+  - `short`（短边翻转）背面各页位绕自身中心旋转 `180°`，页内坐标需逆转 180°：
+    `page_x = page_width_mm − 槽内 x`，`page_y = page_height_mm − 槽内 y`。
+- **中缝与空白页位**：落在中缝的点标记 `location = "gutter"`，落在补齐空白页位的点
+  标记 `location = "blank"`；两者均**不返回页码**（`page` 与页内坐标均为 `null`）。
+
+### 响应
+
+按请求 `defects` 顺序逐点返回（`defect_index` 从 1 开始）；顶层回显机台版面参数、
+纸面尺寸与 `defect_count`。上例（4 页、左装订、纸面 430 × 297、`long`）响应：
+
+```json
+{
+  "total_pages": 4,
+  "max_sheets_per_signature": 1,
+  "binding": "left",
+  "page_width_mm": 210.0,
+  "page_height_mm": 297.0,
+  "gutter_mm": 10.0,
+  "duplex_flip": "long",
+  "paper_width_mm": 430.0,
+  "paper_height_mm": 297.0,
+  "defect_count": 3,
+  "defects": [
+    { "defect_index": 1, "location": "page",   "page": 4,    "page_x_mm": 100.0, "page_y_mm": 50.0 },
+    { "defect_index": 2, "location": "page",   "page": 2,    "page_x_mm": 30.0,  "page_y_mm": 40.0 },
+    { "defect_index": 3, "location": "gutter", "page": null, "page_x_mm": null,  "page_y_mm": null }
+  ]
+}
+```
+
+其中：点 1 落在正面左槽（第 4 页），页内坐标即槽内坐标；点 2 落在 `long` 背面交换后的
+右槽（第 2 页，槽位 x=220，页内 x = 250 − 220 = 30）；点 3 的 x=215 落在中缝
+`[210, 220)` 内，标记 `gutter` 且不返回页码。若改为 `short` 翻转，点 2 所在背面保持
+槽位（背左 = 2、背右 = 3）且页内坐标逆转 180°。
+
+### 非法参数（4xx）
+
+机台版面参数的校验与 `/api/v1/impose/press-layout` 完全一致；此外 `defects` 为空、
+瑕疵点缺字段或含未定义字段、`side` 不是 `front`/`back`、坐标为非有限值（`NaN` /
+`Infinity`）、**坐标越出纸面**（含负坐标）、**帖号或张号无效**（小于 1 或超出实际
+帖数/张数）时，均返回 `422 Unprocessable Entity`。
 
 ## 双面拼版校样 PDF（POST /api/v1/impose/proof.pdf）
 
@@ -646,7 +745,7 @@ pytest -q
 .
 ├── app/
 │   ├── __init__.py
-│   ├── imposition.py   # 拼版核心算法（分帖 + 帖内拼版 + 机台版面）
+│   ├── imposition.py   # 拼版核心算法（分帖 + 帖内拼版 + 机台版面 + 瑕疵定位）
 │   ├── proof.py        # 双面拼版校样 PDF 生成（沿用机台版面结果）
 │   ├── fonts/          # 校样 PDF 嵌入的子集化中文字体
 │   └── main.py         # FastAPI 路由与参数校验

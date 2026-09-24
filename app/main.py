@@ -13,6 +13,7 @@ from .imposition import (
     impose,
     impose_chapters,
     inspect_observed_sheets,
+    locate_defects,
     plan_reprint,
     press_layout,
     UNREAD,
@@ -35,9 +36,11 @@ app = FastAPI(
         "支持印张抽检：把乱序实物印张（可原样/左右镜像/正反互换/两者组合解释）"
         "与预期拼版配对并核对已知页位。"
         "支持机台版面：在拼版结果上给出纸面尺寸与正反面各页位的坐标、旋转角。"
+        "支持瑕疵定位：把纸面上的瑕疵点（帖号/张号/面/坐标）反查为原稿页码"
+        "与阅读方向的页内坐标，中缝与空白页位单独标记。"
         "支持双面拼版校样：按机台版面输出可下载的 proof.pdf。"
     ),
-    version="1.5.0",
+    version="1.6.0",
 )
 
 
@@ -163,6 +166,99 @@ class PressLayoutResponse(BaseModel):
     paper_height_mm: float = Field(..., description="纸面高度（mm）= 页高")
     signature_count: int
     signatures: list[PressLayoutSignature]
+
+
+# ---------------------------------------------------------------------------
+# 瑕疵定位 /api/v1/impose/locate-defects
+# ---------------------------------------------------------------------------
+
+
+class DefectPoint(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    signature_index: int = Field(..., ge=1, description="帖号，从 1 开始")
+    sheet_index: int = Field(
+        ..., ge=1, description="帖内张号，从 1 开始（1 为最外张）"
+    )
+    side: Literal["front", "back"] = Field(
+        ..., description="正反面：front=正面，back=背面"
+    )
+    x_mm: float = Field(
+        ..., description="瑕疵点 x 坐标（mm），以纸面左上角为原点、向右为正"
+    )
+    y_mm: float = Field(
+        ..., description="瑕疵点 y 坐标（mm），以纸面左上角为原点、向下为正"
+    )
+
+    @field_validator("x_mm", "y_mm")
+    @classmethod
+    def validate_finite_mm(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("瑕疵点坐标必须为有限数值（单位 mm）")
+        return value
+
+
+class LocateDefectsRequest(PressLayoutRequest):
+    """瑕疵定位请求：机台版面全部参数 + 瑕疵点列表，复用同一套校验。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    defects: list[DefectPoint] = Field(
+        ..., min_length=1, description="瑕疵点列表，至少 1 个"
+    )
+
+    @model_validator(mode="after")
+    def validate_defect_points(self) -> "LocateDefectsRequest":
+        # 帖号/张号越界、坐标越出纸面时 locate_defects 抛 ValueError -> 422；
+        # 这里仅做校验，响应结果在端点内重新计算
+        locate_defects(
+            total_pages=self.total_pages,
+            max_sheets=self.max_sheets_per_signature,
+            binding=self.binding,
+            page_width_mm=self.page_width_mm,
+            page_height_mm=self.page_height_mm,
+            gutter_mm=self.gutter_mm,
+            duplex_flip=self.duplex_flip,
+            defects=[
+                (d.signature_index, d.sheet_index, d.side, d.x_mm, d.y_mm)
+                for d in self.defects
+            ],
+        )
+        return self
+
+
+class DefectLocation(BaseModel):
+    defect_index: int = Field(
+        ..., description="瑕疵点序号，从 1 开始（按请求 defects 顺序）"
+    )
+    location: Literal["page", "gutter", "blank"] = Field(
+        ..., description="落点类型：page=页内，gutter=中缝，blank=空白页位"
+    )
+    page: Optional[int] = Field(
+        ..., description="原稿页码；gutter/blank 为 null"
+    )
+    page_x_mm: Optional[float] = Field(
+        ..., description="阅读方向页内 x 坐标（mm），从页面左上角起算；gutter/blank 为 null"
+    )
+    page_y_mm: Optional[float] = Field(
+        ..., description="阅读方向页内 y 坐标（mm），从页面左上角起算；gutter/blank 为 null"
+    )
+
+
+class LocateDefectsResponse(BaseModel):
+    total_pages: int
+    max_sheets_per_signature: int
+    binding: Literal["left", "right"]
+    page_width_mm: float
+    page_height_mm: float
+    gutter_mm: float
+    duplex_flip: Literal["long", "short"]
+    paper_width_mm: float = Field(..., description="纸面宽度（mm）= 2 × 页宽 + 中缝")
+    paper_height_mm: float = Field(..., description="纸面高度（mm）= 页高")
+    defect_count: int = Field(..., description="瑕疵点总数")
+    defects: list[DefectLocation] = Field(
+        ..., description="逐点定位结果，按请求 defects 顺序"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -465,6 +561,29 @@ def create_press_layout(request: PressLayoutRequest) -> PressLayoutResponse:
         duplex_flip=request.duplex_flip,
     )
     return PressLayoutResponse(**layout)
+
+
+@app.post(
+    "/api/v1/impose/locate-defects",
+    response_model=LocateDefectsResponse,
+    tags=["拼版"],
+    summary="瑕疵定位：纸面坐标反查原稿页码与页内坐标",
+)
+def create_locate_defects(request: LocateDefectsRequest) -> LocateDefectsResponse:
+    result = locate_defects(
+        total_pages=request.total_pages,
+        max_sheets=request.max_sheets_per_signature,
+        binding=request.binding,
+        page_width_mm=request.page_width_mm,
+        page_height_mm=request.page_height_mm,
+        gutter_mm=request.gutter_mm,
+        duplex_flip=request.duplex_flip,
+        defects=[
+            (d.signature_index, d.sheet_index, d.side, d.x_mm, d.y_mm)
+            for d in request.defects
+        ],
+    )
+    return LocateDefectsResponse(**result)
 
 
 @app.post(

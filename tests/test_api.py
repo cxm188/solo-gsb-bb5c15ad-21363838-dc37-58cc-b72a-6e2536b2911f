@@ -1125,3 +1125,216 @@ def test_proof_missing_field():
     del body["duplex_flip"]
     response = client.post("/api/v1/impose/proof.pdf", json=body)
     assert response.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# 瑕疵定位 /api/v1/impose/locate-defects
+# ---------------------------------------------------------------------------
+
+LOCATE_DEFECTS_BASE = {
+    "total_pages": 4,
+    "max_sheets_per_signature": 1,
+    "binding": "left",
+    "page_width_mm": 210.0,
+    "page_height_mm": 297.0,
+    "gutter_mm": 10.0,
+    "duplex_flip": "long",
+}
+
+
+def test_locate_defects_front_and_long_back():
+    body = {
+        **LOCATE_DEFECTS_BASE,
+        "defects": [
+            {"signature_index": 1, "sheet_index": 1, "side": "front",
+             "x_mm": 100.0, "y_mm": 50.0},
+            {"signature_index": 1, "sheet_index": 1, "side": "back",
+             "x_mm": 250.0, "y_mm": 40.0},
+        ],
+    }
+    response = client.post("/api/v1/impose/locate-defects", json=body)
+    assert response.status_code == 200
+    data = response.json()
+    assert data["paper_width_mm"] == 430.0
+    assert data["defect_count"] == 2
+    front, back = data["defects"]
+    # 左装订正面左槽 = 第 4 页，页内坐标即槽内坐标
+    assert front == {
+        "defect_index": 1,
+        "location": "page",
+        "page": 4,
+        "page_x_mm": 100.0,
+        "page_y_mm": 50.0,
+    }
+    # long 背面交换槽位：右槽 = 第 2 页（x=220 -> 页内 x=30）
+    assert back == {
+        "defect_index": 2,
+        "location": "page",
+        "page": 2,
+        "page_x_mm": 30.0,
+        "page_y_mm": 40.0,
+    }
+
+
+def test_locate_defects_short_flip_back_reverses_180():
+    body = {
+        **LOCATE_DEFECTS_BASE,
+        "gutter_mm": 0,
+        "duplex_flip": "short",
+        "defects": [
+            {"signature_index": 1, "sheet_index": 1, "side": "back",
+             "x_mm": 100.0, "y_mm": 50.0},
+        ],
+    }
+    response = client.post("/api/v1/impose/locate-defects", json=body)
+    assert response.status_code == 200
+    item = response.json()["defects"][0]
+    # short 背面保持槽位（背左 = 2），页内坐标逆转 180°
+    assert item["location"] == "page"
+    assert item["page"] == 2
+    assert item["page_x_mm"] == pytest.approx(110.0)
+    assert item["page_y_mm"] == pytest.approx(247.0)
+
+
+def test_locate_defects_gutter_and_blank_marked_without_page():
+    body = {
+        **LOCATE_DEFECTS_BASE,
+        "total_pages": 1,
+        "defects": [
+            {"signature_index": 1, "sheet_index": 1, "side": "front",
+             "x_mm": 215.0, "y_mm": 100.0},   # 中缝 [210, 220)
+            {"signature_index": 1, "sheet_index": 1, "side": "front",
+             "x_mm": 100.0, "y_mm": 100.0},   # 1 页补 3 空白：正面左槽空白
+            {"signature_index": 1, "sheet_index": 1, "side": "front",
+             "x_mm": 300.0, "y_mm": 100.0},   # 正面右槽 = 第 1 页
+        ],
+    }
+    response = client.post("/api/v1/impose/locate-defects", json=body)
+    assert response.status_code == 200
+    gutter, blank, page = response.json()["defects"]
+    assert gutter == {
+        "defect_index": 1, "location": "gutter",
+        "page": None, "page_x_mm": None, "page_y_mm": None,
+    }
+    assert blank == {
+        "defect_index": 2, "location": "blank",
+        "page": None, "page_x_mm": None, "page_y_mm": None,
+    }
+    assert page["location"] == "page"
+    assert page["page"] == 1
+    assert page["page_x_mm"] == 80.0
+
+
+def test_locate_defects_out_of_paper_returns_422():
+    for x_mm, y_mm in ((-1.0, 10.0), (430.1, 10.0), (10.0, -1.0), (10.0, 297.1)):
+        body = {
+            **LOCATE_DEFECTS_BASE,
+            "defects": [
+                {"signature_index": 1, "sheet_index": 1, "side": "front",
+                 "x_mm": x_mm, "y_mm": y_mm},
+            ],
+        }
+        response = client.post("/api/v1/impose/locate-defects", json=body)
+        assert response.status_code == 422
+
+
+def test_locate_defects_invalid_signature_or_sheet_returns_422():
+    for signature_index, sheet_index in ((2, 1), (1, 2), (0, 1), (1, 0), (-1, 1)):
+        body = {
+            **LOCATE_DEFECTS_BASE,
+            "defects": [
+                {"signature_index": signature_index, "sheet_index": sheet_index,
+                 "side": "front", "x_mm": 10.0, "y_mm": 10.0},
+            ],
+        }
+        response = client.post("/api/v1/impose/locate-defects", json=body)
+        assert response.status_code == 422
+
+
+def test_locate_defects_multi_signature():
+    body = {
+        **LOCATE_DEFECTS_BASE,
+        "total_pages": 6,
+        "defects": [
+            {"signature_index": 2, "sheet_index": 1, "side": "front",
+             "x_mm": 320.0, "y_mm": 10.0},
+        ],
+    }
+    response = client.post("/api/v1/impose/locate-defects", json=body)
+    assert response.status_code == 200
+    item = response.json()["defects"][0]
+    # 帖 2 正面右槽 = 第 5 页（x=220 -> 页内 x=100）
+    assert item["location"] == "page"
+    assert item["page"] == 5
+    assert item["page_x_mm"] == 100.0
+
+
+def test_locate_defects_non_finite_coordinates_return_422():
+    payload = (
+        '{"total_pages": 4, "max_sheets_per_signature": 1, "binding": "left", '
+        '"page_width_mm": 210, "page_height_mm": 297, "gutter_mm": 10, '
+        '"duplex_flip": "long", "defects": [{"signature_index": 1, '
+        '"sheet_index": 1, "side": "front", "x_mm": NaN, "y_mm": 10}]}'
+    )
+    response = client.post(
+        "/api/v1/impose/locate-defects",
+        content=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    assert response.status_code == 422
+
+
+def test_locate_defects_invalid_side_returns_422():
+    body = {
+        **LOCATE_DEFECTS_BASE,
+        "defects": [
+            {"signature_index": 1, "sheet_index": 1, "side": "top",
+             "x_mm": 10.0, "y_mm": 10.0},
+        ],
+    }
+    response = client.post("/api/v1/impose/locate-defects", json=body)
+    assert response.status_code == 422
+
+
+def test_locate_defects_empty_defects_returns_422():
+    response = client.post(
+        "/api/v1/impose/locate-defects",
+        json={**LOCATE_DEFECTS_BASE, "defects": []},
+    )
+    assert response.status_code == 422
+
+
+def test_locate_defects_layout_validation_reused():
+    # 机台版面参数校验沿用：尺寸非正数、翻转模式非法、未定义字段
+    defect = {"signature_index": 1, "sheet_index": 1, "side": "front",
+              "x_mm": 10.0, "y_mm": 10.0}
+    for override in (
+        {"page_width_mm": 0},
+        {"page_height_mm": -1},
+        {"gutter_mm": -0.5},
+        {"duplex_flip": "side"},
+        {"binding": "top"},
+        {"total_pages": 0},
+    ):
+        response = client.post(
+            "/api/v1/impose/locate-defects",
+            json={**LOCATE_DEFECTS_BASE, **override, "defects": [defect]},
+        )
+        assert response.status_code == 422
+    response = client.post(
+        "/api/v1/impose/locate-defects",
+        json={**LOCATE_DEFECTS_BASE, "defects": [defect], "extra": 1},
+    )
+    assert response.status_code == 422
+
+
+def test_locate_defects_missing_field_returns_422():
+    body = {**LOCATE_DEFECTS_BASE}
+    response = client.post("/api/v1/impose/locate-defects", json=body)
+    assert response.status_code == 422
+    body = {
+        **LOCATE_DEFECTS_BASE,
+        "defects": [{"signature_index": 1, "sheet_index": 1, "side": "front"}],
+    }
+    response = client.post("/api/v1/impose/locate-defects", json=body)
+    assert response.status_code == 422
